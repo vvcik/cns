@@ -1,0 +1,229 @@
+CNS-RUST 服务端整理说明
+
+本文件是 cns-rust 服务端交付包的统一说明，由原来分散的「cns-使用方式.md」与
+「cns-rust-server/README.md」合并去重而来，排版对齐主项目 docs 的纯文本风格。
+配套二进制与源码包照原样保留在同级目录。
+
+
+cns-rust 是什么（与 cns 的关系）
+
+  cns 是协议名（CuteBi Network Server）：目标地址写在自定义 HTTP 头里发给服务端，
+  伪装成普通 HTTP 请求。cns-rust 是 Go 原版 cns 服务端的 Rust 重写（v0.4.3，
+  tokio 异步 + rustls/ring），与 Go 原版协议级兼容。
+
+  「cns」与「cns-rust」两种名字的关系，分两处理解：
+
+    1) 服务端实现名：Go 原版叫 cns，Rust 重写叫 cns-rust。两者是同一套协议的
+       不同实现，客户端配置完全共用。
+
+    2) 客户端 UDP 线规选择器：nwproxy 客户端写 udpout: cns-rust 时，选用 Rust 版
+       新增的 UDP 承载线规，对应服务端配置 udp_flag_rust（默认 cnsrUDP）。写
+       udpout: cns（或第三方 CLNC）时走旧线规，对应服务端 udp_flag（默认 httpUDP）。
+
+  结论：没有独立的「cns-rust 配置」。客户端侧只有一套 cns* 键
+  （cns / cnsKey / cnshost / cnsEnc / cnsPath / cnsHeaders / cnsUdpFlag），
+  cns 与 cns-rust 共用全部配置、TCP 行为一致；区别只在 UDP 线规的新旧之分。
+
+
+交付物（同级目录三件套）
+
+  cns-linux-amd64          编译好的服务端二进制（ELF x86-64，PIE，stripped，glibc 动态链接）
+  cns-rust-server-src.tar.xz  完整源码树（含各模块、测试与构建工具链）
+  cns-rust-说明.txt        本文件
+
+  运行环境：任意 x86-64 Linux（glibc）。不需要 root；仅 enable_tfo=true（TCP
+  FastOpen）要求有效 UID 为 0，非 root 时静默降级不报错。
+
+
+快速开始
+
+  # 1) 最小可用配置：一个明文监听 + HTTP DNS
+  cat > cns.json <<'EOF'
+  {
+    "listen_addr": [":22222"],
+    "enable_httpdns": true
+  }
+  EOF
+
+  # 2) 后台启动（守护进程 + 崩溃自动重启）
+  ./cns-linux-amd64 -daemon=true -json=cns.json
+
+  # 3) 验证
+  ss -tlnp | grep 2222          # 监听就绪（:port 为双栈通配 [::]，v6 不可用回退 0.0.0.0）
+  ./cns-linux-amd64 -version    # cns version 0.4.3
+
+  HTTP DNS 验证（无需客户端，dn= 即查）：
+  curl -s "http://127.0.0.1:22222/?dn=example.com"          # A 记录
+  curl -s "http://127.0.0.1:22222/?dn=example.com&type=AAAA" # IPv6 记录
+
+  隧道验证：cns 客户端协议是「先发带 Host 的 HTTP 头 → 收服务端 200 隧道响应 →
+  再发真实请求数据」。标准代理客户端（如 curl -x）直接拿来用只适用于 CONNECT
+  （https）场景——明文 HTTP 的 absolute-form GET 会被 cns 的自定义 200 OK 握手头
+  接管。配套客户端（CLNC / nwproxy 客户端）已内置该握手，无需关心。
+
+
+命令行参数
+
+  -h / -help           显示帮助后退出（rc 0）
+  -version             显示版本后退出（rc 0）
+  -json <路径>         必填，JSON 配置文件路径（-json=cns.json 或 -json cns.json）
+  -daemon              布尔（-daemon=true / =1 开启；=false / =0 前台）
+                       -daemon=true 时父进程拉起后台子进程后自身以 0 退出
+
+  非法参数（如 -daemon=maybe、未知 flag）按 Go flag 同语义拒绝，rc=2。
+
+
+退出码判障表（服务端默认零日志，码值即判障通道）
+
+  0   正常退出；-daemon 拉起成功（不代表服务已就绪）
+  1   supervisor 收到 SIGTERM/SIGINT/SIGHUP/SIGQUIT 停机
+  2   ARGS          参数解析失败
+  3   NO_CONFIG     未给 -json
+  4   CONFIG_LOAD   配置装载失败（JSON 坏、根非对象、udp_flag 与 udp_flag_rust 同值）
+  5   SPAWN_CHILD   子进程 spawn 失败
+  6   TLS_CERT      证书生成/加载失败（fail-closed，配了 TLS 监听绝不静默跳过）
+  7   LISTEN        任一监听地址 bind 失败即整进程退出（fail-closed）
+  8   RUNTIME       tokio runtime 创建失败
+
+  -daemon=true 的父进程退出码 0 仅表示「后台进程拉起成功」。坏配置（4）/证书（6）/
+  监听（7）都发生在父进程退出之后——判障以 supervisor 进程的退出码为准。supervisor
+  连续 5 次「2 秒内快死」后放弃重启，以子进程最近一次退出码退出（永久失败不陷入
+  fork 风暴）。
+
+  码值不跨进程通用：本表是 cns-rust-server 自有约定，与 nwproxy 各 crate 退出码表互不引申。
+
+
+服务端配置键全表（JSON，键名大小写不敏感，未知键静默忽略，未列键走默认值）
+
+  listen_addr            string[]   默认 []        明文监听地址；IP:port 绑指定地址，:port 为 Go 风格通配（双栈 [::]，v6 不可用回退 0.0.0.0）；裸域名/空串拒绝（exit 7）
+  tcp_timeout            整数秒     默认 600       TCP 会话超时；0/负/错型一律消毒回默认（0 值会会话秒断）
+  udp_timeout            整数秒     默认 30        UDP 会话超时，消毒规则同上
+  proxy_key              string     默认 Host      从请求头取目标 host 的头键
+  udp_flag               string     默认 httpUDP   旧协议（Go 原版）UDP 会话握手标志
+  udp_flag_rust          string     默认 cnsrUDP   cns-rust 新线规 UDP 标志；服务端先匹配本值、未命中再按 udp_flag 走旧协议。两者不得同值（同值加载期拒绝，exit 4）
+  encrypt_password       string     默认空（不加密） XOR 流式加密密码（与 Go 版逐字节兼容）；开启后请求头 host 为 Base64+XOR 密文
+  enable_dns_tcpoverudp  bool       默认 false     目标 host 为 *:53 时，TCP DNS 转 UDP DNS
+  enable_httpdns         bool       默认 true      HTTP DNS（uri 带 dn=域名，无认证面，本机解析后 HTTP 响应）
+  enable_tfo             bool       默认 false     TCP FastOpen；仅 Linux + 有效 UID 0 生效，非 root 静默降级
+  pid_path               string     默认空（不写） PID 文件路径
+  tls.listen_addr        string[]   默认 []        TLS 监听地址（通配形式同 listen_addr）；空串表示不启 TLS
+  tls.autocerthosts      string[]   默认 []        按 host 数组自动生成自签 ECDSA P256 证书
+  tls.cert_file          string     默认空         手动指定证书文件
+  tls.key_file           string     默认空         手动指定私钥文件（与 cert_file 必须同时存在）
+
+
+配置示例（cns.json.example）
+
+  {
+    "tcp_timeout": 600,
+    "udp_timeout": 30,
+    "listen_addr": [":2222", ":12224"],
+    "proxy_key": "Host",
+    "encrypt_password": "password",
+    "udp_flag": "httpUDP",
+    "udp_flag_rust": "cnsrUDP",
+    "enable_dns_tcpoverudp": true,
+    "enable_httpdns": true,
+    "enable_tfo": false,
+    "tls": {
+      "listen_addr": ["127.0.0.1:8978", "[::1]:1224", ":9635"],
+      "autocerthosts": ["m.baidu.com", "yaohuo.me", "mymy.ip"],
+      "cert_file": "cert.pem",
+      "key_file": "key.pem"
+    }
+  }
+
+
+功能面（按代码实现）
+
+  1  HTTP CONNECT / 隧道代理——首包识别 HTTP 方法（CONNECT/GET/POST/…），按
+     proxy_key 取目标 host，拨号后双向转发。半关闭语义：任一方向 EOF 只终结该方向
+     （向对端传播 FIN），双向都终结才会话结束。
+
+  2  HTTP DNS——uri 含 dn=域名 即本机解析返回 IP；type=AAAA 返 IPv6、ttl=1 带 TTL。
+     无需隧道握手。
+
+  3  TCP DNS 转 UDP DNS——目标 *:53 时把 2 字节长度前缀的 TCP DNS 转成 UDP 查询，
+     应答按同格式写回。
+
+  4  UDP over HTTP 隧道——首包含 udp_flag（旧）/ udp_flag_rust（新线规，与 nwproxy
+     客户端 udpout: cns-rust 配套）时按 UDP 会话处理；帧格式 2 字节长度 + 协议头
+     （IPv4 约 12B / IPv6 约 24B）+ 载荷，支持 IPv4/IPv6 与 XOR 加密。
+
+  5  TLS——配了 tls.listen_addr 则先 TLS 握手再进同一套隧道逻辑；证书支持手动文件
+     或 autocerthosts 自动生成。
+
+  6  WebSocket 升级——首包含 WebSocket 协商时回 101，隧道照常。
+
+
+客户端配套（nwproxy / CLNC）
+
+  nwproxy 客户端配置键：cns / cnsKey / cnshost / cnsEnc / cnsPath / cnsHeaders /
+  cnsUdpFlag（地址键就叫 cns，不叫 cnsAddr；键名全小写，cnsHost 不生效）。
+
+  UDP 新线规：客户端 udpout: cns-rust  ↔  服务端 udp_flag_rust（默认 cnsrUDP）。
+  第三方 CLNC 等：按 Go 原版协议对接，udp_flag 默认 httpUDP。
+
+  客户端配置键说明（便于对接服务端）：
+    cns         服务器地址，样子 "203.0.113.60:443"（host:port 同引号），必填
+    cnsKey      口令，同时是目标地址所在的自定义头名，必填
+    cnshost     伪装域名；"tls:www.example.com" 前缀=启用 TLS（去前缀作 SNI/Host）；不填用 cns 里的 host
+    cnsEnc      XOR 流加密口令；不填=明文；两端必须一致
+    cnsPath     伪装请求路径；UDP 隧道必须配置
+    cnsUdpFlag  UDP 分流标志；UDP 隧道必须配置
+    cnsHeaders  追加请求头，样子 [ "X-Env: prod" ]；只对 UDP 隧道生效
+
+  容易踩的坑：
+    用 UDP 隧道时 cnsPath 和 cnsUdpFlag 必须配置，否则建不起来
+    cnsEnc 两端不一致时服务端会收到明文目标
+    响应状态码不是 200/101 判失败：服务端不认 cnsKey，或前置 CDN/反代回了 40x/30x
+    cnsHeaders 项缺少冒号或头名会被跳过并打日志，不是报错
+
+
+日志与运维
+
+  默认零日志：服务端不写文件、不打印（svc_log! 默认空操作）。判障三件套：退出码
+  （见上表）+ PID 文件（pid_path）+ 实测连通性。需要事件日志：以 --features
+  server-log 重新编译，日志走限频防刷屏。仅「头中取不到 host」记计数不记内容——
+  异常头最可能携带认证信息。
+
+  systemd 部署样例（有 systemd 时不必再叠 -daemon，二选一）：
+
+    [Unit]
+    Description=cns-rust-server
+    After=network-online.target
+
+    [Service]
+    ExecStart=/opt/cns/cns-linux-amd64 -json=/opt/cns/cns.json
+    Restart=always
+    RestartSec=2
+    LimitNOFILE=1048576
+
+    [Install]
+    WantedBy=multi-user.target
+
+
+从源码构建
+
+  cargo build --release -p cns        # 产物 target/release/cns
+  cargo test -p cns                   # 含 Go 原版 XOR 加密向量，56 个用例
+  cargo build --release -p cns --features server-log   # 带事件日志
+
+  依赖版本由根 workspace 统一给出，锁文件即根 Cargo.lock，全仓一份。
+  crypto 后端取 ring：rustls 默认后端 aws-lc-rs 需 cmake 编 C 库，ring 纯 Rust 无此
+  成本（与主栈口径一致）。release profile：lto=true、codegen-units=1、strip=true。
+
+
+源码树导航（cns-rust-server/）
+
+  src/main.rs        入口、CLI 解析、配置加载、daemon/supervisor、监听装配
+  src/config.rs      JsonConfig/TlsConfig 大小写不敏感载入、timeout 消毒、全局 CONFIG/XOR
+  src/http_tunnel.rs 首包分流：httpDNS / UDP 会话 / TCP 会话 / TLS 升级
+  src/tcp.rs         取 host、TCP 转发、:53 转 dns_tcpOverUdp、阻塞池拨号
+  src/udp.rs         httpUDP 旧协议（纯函数解析）+ UDP 收发
+  src/udp_rust.rs    cns-rust 新线规 UDP 承载（与 nwproxy 客户端配套）
+  src/dns.rs         HTTP DNS 响应、TCP DNS 转 UDP DNS
+  src/tls_side.rs    TLS 监听、证书加载/自动生成（rcgen 自签）
+  src/xorcrypt.rs    XOR 流式加解密（Go 逐字节兼容，含向量测试）
+  src/sys.rs         setrlimit/setsid/TFO/信号处理
+  src/log.rs         事件日志门面（默认零输出，server-log 可开）

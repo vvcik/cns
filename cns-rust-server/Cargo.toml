@@ -1,0 +1,25 @@
+[package]
+name = "cns"
+version = "0.4.3"
+edition = "2021"
+description = "CuteBi Network Server - 基于 Rust 实现的网络代理服务端"
+
+[[bin]]
+name = "cns"
+path = "src/main.rs"
+
+[features]
+default = []
+server-log = []
+
+[dependencies]
+tokio = { workspace = true, features = ["full"] }
+serde_json = { workspace = true }
+base64 = { workspace = true }
+rcgen = { workspace = true }
+rustls = { workspace = true }
+tokio-rustls = { workspace = true }
+rustls-pemfile = { workspace = true }
+libc = { workspace = true }
+socket2 = { workspace = true, features = ["all"] }
+time = { workspace = true }

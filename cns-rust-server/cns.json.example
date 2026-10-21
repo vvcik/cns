@@ -1,0 +1,45 @@
+{
+	"_comment1": "键名不区分大小写；未列出的键走默认值，未知键被忽略",
+	"_comment2": "tcp超时, 默认600秒",
+	"tcp_timeout": 600,
+
+	"_comment3": "udp超时, 默认30秒",
+	"udp_timeout": 30,
+
+	"_comment4": "http_tunnel监听地址, 可设置多个; \"IP:port\"绑定指定地址, \":port\"为Go风格通配(双栈, v6不可用时退0.0.0.0)",
+	"listen_addr": [":2222", ":12224"],
+
+	"_comment5": "设定请求头中获取host的key, 默认Host",
+	"proxy_key": "Host",
+
+	"_comment6": "加密密码, 默认没有密码(普通http_tunnel代理)",
+	"encrypt_password": "password",
+
+	"_comment7": "UDP分流标志: 客户端cnsUdpFlag需与其匹配, 默认httpUDP",
+	"udp_flag": "httpUDP",
+
+	"_comment8": "cns-rust新线规的UDP标志, 对应客户端udpout:cns-rust, 默认cnsrUDP",
+	"udp_flag_rust": "cnsrUDP",
+
+	"_comment9": "开启tcpDNS转udpDNS, 可稍微加快DNS解析速度, 默认关闭",
+	"enable_dns_tcpoverudp": true,
+
+	"_comment10": "开启httpDNS, httpDNS无需http_tunnel握手, 可稍微加快DNS解析速度, 默认开启",
+	"enable_httpdns": true,
+
+	"_comment11": "开启tcpFastOpen, 可稍微加快创建连接速度(免流可能不适用), 默认关闭",
+	"enable_tfo": false,
+
+	"_comment12": "以下是tls配置",
+	"tls": {
+		"_comment13": "tls监听地址, 可设置多个; 通配形式同 listen_addr",
+		"listen_addr": ["127.0.0.1:8978", "[::1]:1224", ":9635"],
+
+		"_comment14": "自动生成指定host的ssl/tls证书(如果留空则所有host都可以连接)",
+		"autocerthosts": ["m.baidu.com", "yaohuo.me", "mymy.ip"],
+
+		"_comment15": "手动指定cert和key文件, 两者必须同时存在",
+		"cert_file": "cert.pem",
+		"key_file": "key.pem"
+	}
+}
